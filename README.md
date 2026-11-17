@@ -52,6 +52,8 @@ Read them in this order. Each one is self-contained, but later guides assume the
 
 Guide 2 needs only a UART console, so it can be done before or after guide 1. Guide 3 needs both.
 
+**On Linux?** The three guides above assume Windows + Ubuntu WSL. There is a single, self-contained **[Complete Linux Guide](docs/sideload-linux.md)** that covers the same end-to-end workflow natively — no Windows, WSL or UsbDk — using the mtkclient CLI and a serial console.
+
 ---
 
 ## How this project works
