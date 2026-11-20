@@ -67,6 +67,19 @@ Phase 6  Live deploy      → UART: root → remount rw → swap services.jar �
 > [!CAUTION]
 > **Risk:** This process unlocks and modifies a car head unit. A wrong flash can brick the IHU. Follow every step in order, don't skip. All original files are **renamed**, never deleted — so if it bootloops you can recover over UART. Keep the `ORI` folder and the partition dump safe.
 
+
+### Does this apply to your unit?
+
+Check both numbers before you start. The software version alone is not enough — the same model can ship more than one hardware revision, and a method verified on one is not automatically safe on the other.
+
+| Model | IHU software versions | Hardware version |
+|---|---|---|
+| **Proton S70** Flagship & Flagship X | v333, v300, v209, v202 | `HW0SS110506M0101` |
+| **Proton X50 RC** | v144, v115 | `HW0SX110506M0101` or `HW0SX110506H0101` |
+| **Proton X90** Flagship | v735, v722, v694, v651, v647, v638 | `HW0VX110506H0101` |
+
+All of the above run **Android 9** on the ECarX E02 platform. Newer platforms running **Android 10** (dynamic partitions, `super.bin`) use a different partition layout and are **not** supported by this guide.
+
 ### What is different from the Windows guides
 
 | Windows + WSL guide | This Linux guide |
@@ -102,6 +115,23 @@ Everything else — the byte patterns, offsets, four smali patches, Magisk optio
 | Linux PC | Any mainstream distro with USB and a serial port. |
 | **Stable 12 V supply** | Bench supply set to 12.0–12.6 V with at least 5 A, or a healthy car battery on a charger. Never flash on a weak battery, with the engine cranking, or where start-stop can cut accessory power. |
 | Multimeter | To prove white↔blue and green↔red are the only two joins before anything is powered. |
+
+
+![CH340G USB-to-TTL adapter seen from above, pin header labelled 5V, 3V3, TXD, RXD, GND](../images/ch340g-adapter-front.jpg)
+
+*CH340G adapter. The pin header is labelled `5V`, `3V3`, `TXD`, `RXD`, `GND`.*
+
+![The same CH340G adapter at an angle, showing the yellow voltage-select jumper](../images/ch340g-adapter-angled.jpg)
+
+*The yellow jumper selects the voltage. It must sit on **3V3**, never 5V.*
+
+![Micro JST GH 6-pin cable with the white connector on the right and bare tinned wire ends](../images/jst-6pin-cable-connector.jpg)
+
+*Micro JST GH 6-pin cable, single connector. The connector plugs into the IHU; the bare ends go to the adapter.*
+
+![A plain USB-A flash drive photographed from above](../images/usb-flash-drive-top.jpg)
+
+*Any small USB-A drive works, as long as it is formatted **FAT32**.*
 
 > [!CAUTION]
 > **Before you buy anything else, get heat shrink or electrical tape.** The Micro JST GH cable arrives with six bare tinned ends. Three (yellow, black, white) are your permanent UART wires; the other three — blue, green and red — you short only briefly in [Step 8](#step-8--brom-back-up-erase-unlock-flash) for BROM, and the rest of the time they sit bare and live next to your working wires, with red carrying **3.3V from the IHU** whenever the unit is powered. Cover them whenever you are not deliberately shorting them.
@@ -150,7 +180,7 @@ On Ubuntu the `smali` package provides both `smali` and `baksmali` (v2.5.x, whic
 
 ```bash
 # Fedora
-sudo dnf install python3 python3-pip git gcc make zlib-devel fuse-devel libusb1-devel picocom zip unzip vim-common
+sudo dnf install python3 python3-devel python3-pip git gcc make zlib-devel fuse-devel libusb1-devel picocom zip unzip vim-common
 # Arch
 sudo pacman -S python python-pip git base-devel zlib fuse2 libusb picocom zip unzip vim
 ```
@@ -160,17 +190,19 @@ sudo pacman -S python python-pip git base-devel zlib fuse2 libusb picocom zip un
 Your user needs to open the CH340 adapter and the mtkclient USB endpoint. Add yourself to the serial groups now; the udev rule copy happens in [2.4](#24--install-mtkclient), after the clone exists:
 
 ```bash
-sudo usermod -aG dialout,plugdev "$USER"
+for g in dialout plugdev uucp; do
+  getent group "$g" >/dev/null && sudo usermod -aG "$g" "$USER"
+done
 ```
 
 **Reboot now** so the group change takes effect.
 
 > [!WARNING]
-> **ModemManager / brltty can steal the port.** On some distros ModemManager claims the CH340 as a modem, or brltty claims it as a braille display, and the serial console then produces nothing. If `/dev/ttyUSB0` exists but picocom shows no boot log, stop them temporarily:
+> **ModemManager / brltty can steal UART and break BROM handshakes.** On desktop distros ModemManager probes both `/dev/ttyUSB0` (CH340) and `/dev/ttyACM0` (which is how the MediaTek `0e8d:0003` BROM endpoint enumerates). An `AT` probe sent to BROM consumes the single-shot handshake and makes `mtk` fail until you power-cycle. The udev rule in [2.4](#24--install-mtkclient) tells ModemManager to ignore MediaTek USB IDs; you should also stop both services before UART or BROM sessions:
 > ```bash
-> sudo systemctl stop ModemManager brltty
+> sudo systemctl stop ModemManager brltty 2>/dev/null || true
 > ```
-> They are only needed if you actually use a modem or braille display.
+> They are only needed if you actually use a cellular modem or braille display.
 
 ### 2.3 — Find the serial device
 
@@ -205,6 +237,8 @@ Install the udev rules now that the clone exists, then check the CLI runs (neith
 
 ```bash
 sudo cp ~/mtkclient/Setup/Linux/*.rules /etc/udev/rules.d/
+printf '\n# Prevent ModemManager from probing MediaTek BROM/Preloader CDC ACM endpoints\nATTRS{idVendor}=="0e8d", ENV{ID_MM_DEVICE_IGNORE}="1", ENV{ID_MM_PORT_IGNORE}="1"\n' \
+  | sudo tee -a /etc/udev/rules.d/52-mtk.rules >/dev/null
 sudo udevadm control -R && sudo udevadm trigger
 mtk --help | head -30
 ```
@@ -251,6 +285,18 @@ This first UART session is only to pull `services.vdex` off the IHU. You will re
 
 Port location and the full six-pin table are in [8.2](#82--enter-brom-mode). For UART you use only three wires: **yellow, black and white**. Green, blue and red are shorted only for BROM; keep them insulated for all UART work — leave the green pin un-shorted or the USB drive in [Step 4](#step-4--pull-servicesvdex-off-the-ihu) will not mount.
 
+![Side panel of the ECarX E02 chassis with the Micro JST GH port low down, next to a red TAP marking](../images/jst-port-location.jpg)
+
+*Where to look: the port sits low on the side panel of the chassis. The red **TAP** marking here is hand-written; your unit will not have it.*
+
+![Close-up of the Micro JST GH port showing six gold pins inside a white plastic housing](../images/jst-port-closeup.jpg)
+
+*The same port close up — six pins in a white housing.*
+
+![Micro JST GH 6-pin cable with the wires fanned out, showing white, blue, yellow, green, black and red](../images/jst-6pin-cable-wires.jpg)
+
+*The six wire colours in pin order (1 to 6): white (GND), blue (Recovery), green (USB mode), black (UART RX), yellow (UART TX), red (3.3V).*
+
 > [!CAUTION]
 > **Insulate blue, green and red before the UART working phase. This is the highest-risk part of the hardware setup.** Their ends are **bare tinned copper**, and while the unit is powered:
 >
@@ -274,6 +320,15 @@ Port location and the full six-pin table are in [8.2](#82--enter-brom-mode). For
 ### 3.2 — Wire it up and open the console
 
 - Make sure the IHU **POWER socket is unplugged** before wiring anything — **Socket Block A — Power**, the black connector sitting lowest in the ISO stack.
+
+  ![The ISO connector block on the back of the IHU with all sockets plugged in](../images/power-socket-before.jpg)
+
+  *The ISO connectors as they normally sit, everything still plugged in.*
+
+  ![The same ISO connector block with a red box drawn around the black power socket at the bottom of the stack](../images/power-socket-highlighted.jpg)
+
+  *Unplug the one in the red box: **Socket Block A — Power**, the black connector at the very bottom of the ISO stack.*
+
 - Check blue, green and red are still covered — do this every session, not just the first one.
 - Yellow (IHU TX) → CH340G **RXD**; black (IHU RX) → CH340G **TXD**; white (GND) → CH340G **GND**. TX crosses to RX — wiring TX to TX gives silence.
 - Open the serial console **before** powering on, so you catch the boot log:
@@ -283,6 +338,19 @@ picocom -b 921600 /dev/ttyUSB0
 ```
 
 - Plug the IHU POWER socket back in — the boot log starts scrolling. Wait for boot to finish, then press **Enter** once to get a prompt.
+
+
+![CH340G adapter from above with three jumper wires attached to the pin header](../images/ch340g-jumper-wires-top.jpg)
+
+*Only three wires are used — yellow, black and white — on `TXD`, `RXD` and `GND`.*
+
+![The same three jumper wires at an angle, with the pin labels readable](../images/ch340g-jumper-wires-angled.jpg)
+
+*Angled view, so you can check each wire against its pin label.*
+
+![CH340G adapter joined by jumper wires to the Micro JST GH 6-pin cable, ready to plug into the IHU](../images/ch340g-jst-cable-wired.jpg)
+
+*The finished lead: adapter, three jumpers, and the JST GH cable that plugs into the IHU.*
 
 > [!TIP]
 > The prompt should look like `console:/ $`. The `$` means you are **not** root yet — that is normal, [Step 4](#step-4--pull-servicesvdex-off-the-ihu) calls the factory `su`.
@@ -559,6 +627,10 @@ ls -lh "$BASE/MOD/services.jar"
 > [!CAUTION]
 > It must be about **3.7MB**, definitely not 183 bytes (the stub). Confirm it is `dex 039`: `unzip -p "$BASE/MOD/services.jar" classes.dex | head -c 8 | xxd` must read `dex 039`. A `dex 035` build boots but leaves installs blocked.
 
+
+> [!IMPORTANT]
+> **Next physical step: jump to [Step 8.1–8.3 (Session A — read-only dump)](#83--session-a-back-up-everything-read-only) now.** Do **not** run Step 6 or Step 7 yet — `ORI/lk.bin` and `ORI/boot.bin` do not exist until you dump your unit's partitions in 8.3 and copy them into `ORI/`. Once 8.3 finishes and the unit is powered down, come back to Step 6.
+
 ---
 
 ## Step 6 — Patch lk.bin
@@ -606,8 +678,9 @@ PY
 **Make the copy, then patch only `MOD/lk.bin`:**
 
 ```bash
+rm -f "$BASE/MOD/lk.bin"
 cp "$BASE/ORI/lk.bin" "$BASE/MOD/lk.bin"
-echo aW1wb3J0IHN5cywgb3MKYmFzZSA9IG9zLmVudmlyb25bIkJBU0UiXQpvcmkgPSBvcGVuKGJhc2UgKyAiL09SSS9say5iaW4iLCAicmIiKS5yZWFkKCkKbW9kX3BhdGggPSBiYXNlICsgIi9NT0QvbGsuYmluIgpQQVRURVJOICA9IGJ5dGVzKFsweDBFLCAweDRCLCAweDdCLCAweDQ0XSkKUEFUQ0ggICAgPSBieXRlcyhbMHgwMCwgMHgyMCwgMHgwOCwgMHhCRF0pClBST0xPR1VFID0gYnl0ZXMoWzB4MDgsIDB4QjVdKQpmb3VuZCA9IE5vbmUKcG9zID0gMAp3aGlsZSBUcnVlOgogICAgaWR4ID0gb3JpLmZpbmQoUEFUVEVSTiwgcG9zKQogICAgaWYgaWR4ID09IC0xOgogICAgICAgIGJyZWFrCiAgICBpZiBQUk9MT0dVRSBpbiBvcmlbbWF4KDAsIGlkeCAtIDE2KTppZHhdOgogICAgICAgIGZvdW5kID0gaWR4CiAgICAgICAgYnJlYWsKICAgIHBvcyA9IGlkeCArIDEKaWYgZm91bmQgaXMgTm9uZToKICAgIHByaW50KCJFUlJPUjogUGF0dGVybiBub3QgZm91bmQuIFRoaXMgZmlybXdhcmUgdmVyc2lvbiBtYXkgbm90IGJlIHN1cHBvcnRlZC4iKQogICAgcHJpbnQoIiAgICAgICBEbyBub3QgY29udGludWUuIE1ha2Ugc3VyZSBsay5iaW4gY2FtZSBmcm9tIHlvdXIgb3duIHVuaXQuIikKICAgIHN5cy5leGl0KDEpCnByaW50KCJbK10gRm91bmQgYXQgb2Zmc2V0IDogMHglMDhYIChkZWNpbWFsOiAlZCkiICUgKGZvdW5kLCBmb3VuZCkpCnByaW50KCJbK10gT3JpZ2luYWwgYnl0ZXMgIDogIiArIG9yaVtmb3VuZDpmb3VuZCs0XS5oZXgoIiAiKS51cHBlcigpKQp3aXRoIG9wZW4obW9kX3BhdGgsICJyK2IiKSBhcyBmOgogICAgZi5zZWVrKGZvdW5kKQogICAgY3VyID0gZi5yZWFkKDQpCiAgICBpZiBjdXIgPT0gUEFUQ0g6CiAgICAgICAgcHJpbnQoIlshXSBBbHJlYWR5IHBhdGNoZWQgLSBub3RoaW5nIGNoYW5nZWQuIikKICAgIGVsaWYgY3VyICE9IFBBVFRFUk46CiAgICAgICAgcHJpbnQoIkVSUk9SOiBVbmV4cGVjdGVkIGJ5dGVzIGluIE1PRCBmaWxlOiAiICsgY3VyLmhleCgiICIpLnVwcGVyKCkpCiAgICAgICAgcHJpbnQoIiAgICAgICBEZWxldGUgTU9EL2xrLmJpbiwgY29weSBpdCBhZ2FpbiBmcm9tIE9SSSwgdGhlbiByZXRyeS4iKQogICAgICAgIHN5cy5leGl0KDEpCiAgICBlbHNlOgogICAgICAgIGYuc2Vlayhmb3VuZCkKICAgICAgICBmLndyaXRlKFBBVENIKQogICAgICAgIHByaW50KCJbK10gUGF0Y2ggd3JpdHRlbiAgIDogIiArIFBBVENILmhleCgiICIpLnVwcGVyKCkpCndpdGggb3Blbihtb2RfcGF0aCwgInJiIikgYXMgZjoKICAgIGYuc2Vlayhmb3VuZCkKICAgIHJlcyA9IGYucmVhZCg0KQppZiByZXMgPT0gUEFUQ0g6CiAgICBwcmludCgiIikKICAgIHByaW50KCJbT0tdIFBBVENIIFNVQ0NFU1NGVUwiKQogICAgcHJpbnQoIiAgICAgT2Zmc2V0ICAgOiAweCUwOFgiICUgZm91bmQpCiAgICBwcmludCgiICAgICBCeXRlcyAgICA6ICIgKyByZXMuaGV4KCIgIikudXBwZXIoKSkKICAgIHByaW50KCIgICAgIE9SSSBmaWxlIDogdW50b3VjaGVkIikKZWxzZToKICAgIHByaW50KCJFUlJPUjogVmVyaWZpY2F0aW9uIGZhaWxlZCAtIGJ5dGVzIGFmdGVyIHdyaXRlOiAiICsgcmVzLmhleCgiICIpLnVwcGVyKCkpCiAgICBzeXMuZXhpdCgxKQo= | base64 -d | python3
+echo aW1wb3J0IHN5cywgb3MKYmFzZSA9IG9zLmVudmlyb25bIkJBU0UiXQpvcmlfcGF0aCA9IGJhc2UgKyAiL09SSS9say5iaW4iCm1vZF9wYXRoID0gYmFzZSArICIvTU9EL2xrLmJpbiIKZGVmIGZhaWwobXNnKToKICAgIHByaW50KG1zZykKICAgIGlmIG9zLnBhdGguZXhpc3RzKG1vZF9wYXRoKToKICAgICAgICBvcy5yZW1vdmUobW9kX3BhdGgpCiAgICBzeXMuZXhpdCgxKQppZiBub3Qgb3MucGF0aC5pc2ZpbGUob3JpX3BhdGgpOgogICAgZmFpbCgiRVJST1I6IE9SSS9say5iaW4gbWlzc2luZyDigJQgY29tcGxldGUgdGhlIHJlYWQtb25seSBkdW1wIGluIDguMyBmaXJzdC4iKQpvcmkgPSBvcGVuKG9yaV9wYXRoLCAicmIiKS5yZWFkKCkKUEFUVEVSTiAgPSBieXRlcyhbMHgwRSwgMHg0QiwgMHg3QiwgMHg0NF0pClBBVENIICAgID0gYnl0ZXMoWzB4MDAsIDB4MjAsIDB4MDgsIDB4QkRdKQpQUk9MT0dVRSA9IGJ5dGVzKFsweDA4LCAweEI1XSkKbWF0Y2hlcyA9IFtdCnBvcyA9IDAKd2hpbGUgVHJ1ZToKICAgIGlkeCA9IG9yaS5maW5kKFBBVFRFUk4sIHBvcykKICAgIGlmIGlkeCA9PSAtMToKICAgICAgICBicmVhawogICAgaWYgUFJPTE9HVUUgaW4gb3JpW21heCgwLCBpZHggLSAxNik6aWR4XToKICAgICAgICBtYXRjaGVzLmFwcGVuZChpZHgpCiAgICBwb3MgPSBpZHggKyAxCmlmIGxlbihtYXRjaGVzKSA9PSAwOgogICAgZmFpbCgiRVJST1I6IFBhdHRlcm4gbm90IGZvdW5kLiBUaGlzIGZpcm13YXJlIHZlcnNpb24gbWF5IG5vdCBiZSBzdXBwb3J0ZWQuXG4gICAgICAgRG8gbm90IGNvbnRpbnVlLiBNYWtlIHN1cmUgbGsuYmluIGNhbWUgZnJvbSB5b3VyIG93biB1bml0LiIpCmlmIGxlbihtYXRjaGVzKSAhPSAxOgogICAgZmFpbCgiRVJST1I6IE11bHRpcGxlIHBhdHRlcm4gbWF0Y2hlcyBmb3VuZDogJXNcbiAgICAgICBEbyBub3QgcGF0Y2ggb3IgZmxhc2ggdGhpcyBsay5iaW4uIiAlIFtoZXgoeCkgZm9yIHggaW4gbWF0Y2hlc10pCmZvdW5kID0gbWF0Y2hlc1swXQppZiBmb3VuZCBub3QgaW4gKDB4M0IzOTIsIDB4M0MwRkUpOgogICAgZmFpbCgiRVJST1I6IE9mZnNldCAweCUwOFggaXMgbm90IGluIHRoZSBjb25maXJtZWQgbGlzdCAoMHgwMDAzQjM5MiwgMHgwMDAzQzBGRSkuXG4gICAgICAgRG8gbm90IHBhdGNoIG9yIGZsYXNoIHRoaXMgbGsuYmluLiIgJSBmb3VuZCkKcHJpbnQoIlsrXSBGb3VuZCBhdCBvZmZzZXQgOiAweCUwOFggKGRlY2ltYWw6ICVkKSIgJSAoZm91bmQsIGZvdW5kKSkKcHJpbnQoIlsrXSBPcmlnaW5hbCBieXRlcyAgOiAiICsgb3JpW2ZvdW5kOmZvdW5kKzRdLmhleCgiICIpLnVwcGVyKCkpCndpdGggb3Blbihtb2RfcGF0aCwgInIrYiIpIGFzIGY6CiAgICBmLnNlZWsoZm91bmQpCiAgICBjdXIgPSBmLnJlYWQoNCkKICAgIGlmIGN1ciA9PSBQQVRDSDoKICAgICAgICBwcmludCgiWyFdIEFscmVhZHkgcGF0Y2hlZCAtIG5vdGhpbmcgY2hhbmdlZC4iKQogICAgZWxpZiBjdXIgIT0gUEFUVEVSTjoKICAgICAgICBmYWlsKCJFUlJPUjogVW5leHBlY3RlZCBieXRlcyBpbiBNT0QgZmlsZTogIiArIGN1ci5oZXgoIiAiKS51cHBlcigpICsgIlxuICAgICAgIERlbGV0ZSBNT0QvbGsuYmluLCBjb3B5IGl0IGFnYWluIGZyb20gT1JJLCB0aGVuIHJldHJ5LiIpCiAgICBlbHNlOgogICAgICAgIGYuc2Vlayhmb3VuZCkKICAgICAgICBmLndyaXRlKFBBVENIKQogICAgICAgIHByaW50KCJbK10gUGF0Y2ggd3JpdHRlbiAgIDogIiArIFBBVENILmhleCgiICIpLnVwcGVyKCkpCndpdGggb3Blbihtb2RfcGF0aCwgInJiIikgYXMgZjoKICAgIGYuc2Vlayhmb3VuZCkKICAgIHJlcyA9IGYucmVhZCg0KQppZiByZXMgPT0gUEFUQ0g6CiAgICBwcmludCgiIikKICAgIHByaW50KCJbT0tdIFBBVENIIFNVQ0NFU1NGVUwiKQogICAgcHJpbnQoIiAgICAgT2Zmc2V0ICAgOiAweCUwOFgiICUgZm91bmQpCiAgICBwcmludCgiICAgICBCeXRlcyAgICA6ICIgKyByZXMuaGV4KCIgIikudXBwZXIoKSkKICAgIHByaW50KCIgICAgIE9SSSBmaWxlIDogdW50b3VjaGVkIikKZWxzZToKICAgIGZhaWwoIkVSUk9SOiBWZXJpZmljYXRpb24gZmFpbGVkIC0gYnl0ZXMgYWZ0ZXIgd3JpdGU6ICIgKyByZXMuaGV4KCIgIikudXBwZXIoKSkK | base64 -d | python3
 ```
 
 > [!TIP]
@@ -647,35 +720,59 @@ Magisk gets in by patching the boot image with the Magisk app on a phone. This i
 > **An Options screen appears here — before you tap Next:** Make sure `Preserve AVB 2.0 / dm-verity` is **NOT ticked**. Leave it ticked and `/system` will refuse to remount rw, and you will get stuck at [Step 10](#step-10--get-root--remount-rw).
 
 - Tap **Next** → **Select and Patch a File** → go to **Downloads**, pick `boot.bin`
-- Tap **LET'S GO** and wait for it to finish. Magisk saves `magisk_patched_XXXXX.img` in Downloads
-- Copy that file back to the PC, find the exact name and rename it into place:
+- Tap **LET'S GO** and wait for it to finish. Magisk saves `magisk_patched-XXXXX_YYYYY.img` (or `magisk_patched_XXXXX.img` on older Magisk releases) in `Download`
+- Copy that file back to the PC (for example into `~/Downloads` or `$BASE`), or read it straight from the MTP mount, then verify and stage it as `MOD/boot.bin`:
 
 ```bash
 export BASE="${BASE:-$HOME/IHU_DEPLOY}"
-ls -lt /media/"$USER"/*/Download/magisk_patched_*.img \
-       /run/media/"$USER"/*/Download/magisk_patched_*.img \
-       /run/user/"$UID"/gvfs/*/Download/magisk_patched_*.img 2>/dev/null
+ls -lt "$HOME"/Downloads/magisk_patched*.img \
+       "$HOME"/Download/magisk_patched*.img \
+       "$BASE"/magisk_patched*.img \
+       /run/user/"$UID"/gvfs/*/*/Download/magisk_patched*.img \
+       /run/user/"$UID"/gvfs/*/Download/magisk_patched*.img \
+       /media/"$USER"/*/Download/magisk_patched*.img \
+       /run/media/"$USER"/*/Download/magisk_patched*.img 2>/dev/null
 ```
 
-Pick the file the Magisk app just wrote. `ls -lt` above is newest-first; do not blindly take the top entry if more than one phone has been used — check the timestamp for the patch you just ran. Then copy it in:
+Pick the file the Magisk app just wrote. `ls -lt` above is newest-first; do not blindly take the top entry if more than one phone or patch has been used — check the timestamp for the patch you just ran. Then copy and verify it in a guarded subshell:
 
 ```bash
-src=$(ls -t /media/"$USER"/*/Download/magisk_patched_*.img \
-           /run/media/"$USER"/*/Download/magisk_patched_*.img \
-           /run/user/"$UID"/gvfs/*/Download/magisk_patched_*.img 2>/dev/null | head -1)
-[ -n "$src" ] || { echo "STOP: no magisk_patched_*.img found"; }
+(
+set -e
+export BASE="${BASE:-$HOME/IHU_DEPLOY}"
+[ -f "$BASE/ORI/boot.bin" ] || { echo "STOP: ORI/boot.bin missing — do the read-only dump in 8.3 first"; exit 1; }
+src=$(ls -t "$HOME"/Downloads/magisk_patched*.img \
+            "$HOME"/Download/magisk_patched*.img \
+            "$BASE"/magisk_patched*.img \
+            /run/user/"$UID"/gvfs/*/*/Download/magisk_patched*.img \
+            /run/user/"$UID"/gvfs/*/Download/magisk_patched*.img \
+            /media/"$USER"/*/Download/magisk_patched*.img \
+            /run/media/"$USER"/*/Download/magisk_patched*.img 2>/dev/null | head -1)
+[ -n "$src" ] && [ -f "$src" ] || { echo "STOP: no magisk_patched*.img found — copy it to ~/Downloads first"; exit 1; }
 echo "using: $src"
 ls -lh "$src"
 rm -f "$BASE/MOD/boot.bin"
 cp "$src" "$BASE/MOD/boot.bin"
-[ -f "$BASE/MOD/boot.bin" ] || echo "STOP: MOD/boot.bin was not created"
+[ -f "$BASE/MOD/boot.bin" ] || { echo "STOP: MOD/boot.bin was not created"; exit 1; }
 [ "$(stat -c%s "$BASE/MOD/boot.bin")" -le "$(stat -c%s "$BASE/ORI/boot.bin")" ] \
-  || echo "STOP: patched boot is larger than the boot partition"
+  || { echo "STOP: patched boot is larger than the boot partition"; rm -f "$BASE/MOD/boot.bin"; exit 1; }
 [ "$(stat -c%s "$BASE/MOD/boot.bin")" -ge $(( $(stat -c%s "$BASE/ORI/boot.bin") / 4 )) ] \
-  || echo "STOP: patched boot looks truncated — recopy it"
-cmp -s "$BASE/ORI/boot.bin" "$BASE/MOD/boot.bin" \
-  && echo "STOP: MOD/boot.bin is identical to ORI — the Magisk patch did not happen"
+  || { echo "STOP: patched boot looks truncated — recopy it"; rm -f "$BASE/MOD/boot.bin"; exit 1; }
+if cmp -s "$BASE/ORI/boot.bin" "$BASE/MOD/boot.bin"; then
+  echo "STOP: MOD/boot.bin is identical to ORI — the Magisk patch did not happen"
+  rm -f "$BASE/MOD/boot.bin"
+  exit 1
+fi
+python3 - "$BASE/ORI/boot.bin" "$BASE/MOD/boot.bin" <<'PY'
+import sys
+for p in sys.argv[1:]:
+    if open(p, "rb").read(8) != b"ANDROID!":
+        print("STOP: %s does not start with ANDROID! boot magic" % p)
+        sys.exit(1)
+print("boot image magic OK")
+PY
 ls -lh "$BASE/MOD/"
+)
 ```
 
 > [!CAUTION]
@@ -683,6 +780,9 @@ ls -lh "$BASE/MOD/"
 
 > [!TIP]
 > Renaming `.img` to `.bin` is completely safe — the extension is only a label. Your `MOD` folder should now hold `lk.bin` (~1MB), `boot.bin` (~32MB) and `services.jar` (~3.7MB). On Linux MTP usually appears under `/run/user/$UID/gvfs/` or in your file manager; use whichever route copies the two files.
+
+> [!IMPORTANT]
+> **Next physical step:** Now that `MOD/lk.bin`, `MOD/boot.bin` and `MOD/services.jar` are ready, continue to [Step 8.4 (Session B — preflight, erase & unlock)](#84--session-b-erase--unlock-no-image-written).
 
 ---
 
@@ -740,19 +840,22 @@ On the dedicated 4-wire JST jumper, short **white (GND) ↔ blue (Recovery)** an
 - **Make both shorts on the JST jumper** — twisted and tinned, or soldered. A jumper you have to pinch by hand will let go at the worst possible moment, and a short that opens mid-session is exactly how a unit gets bricked. Sleeve the two joins **separately**.
 - **Prove the joins with a multimeter before powering anything.** White↔blue must read a dead short; green↔red must read a dead short; every other pair must read open. If any other pair reads shorted, stop and rebuild the jumper.
 - **Plug the JST jumper into the IHU port.** The CH340/UART cable is unplugged for the whole BROM phase — one connector, one purpose. Do not leave the adapter attached to the side of the unit.
-- **Activate the mtkclient venv** before powering the unit. The CLI commands in [8.3](#83--session-a-back-up-everything-read-only), [8.4](#84--session-b-erase--unlock-no-image-written) and [8.5](#85--session-c-write-lk--boot-then-read-back) do the connecting — there is no GUI to leave listening:
+- **Stop ModemManager and activate the mtkclient venv** before powering the unit:
 
 ```bash
+sudo systemctl stop ModemManager brltty 2>/dev/null || true
 source ~/mtkclient/.venv/bin/activate
 ```
 
+- **Start the `mtk multi ...` command for your current session first** ([8.3](#83--session-a-back-up-everything-read-only), [8.4](#84--session-b-erase--unlock-no-image-written) or [8.5](#85--session-c-write-lk--boot-then-read-back)), and wait until it prints `Status: Waiting for PreLoader VCOM, please reconnect mobile/iot device to brom mode`. Having `mtk` already polling before power-on lets it claim the BROM USB interface the instant it enumerates, before the kernel's `cdc_acm` driver or any background service can touch it.
 - **Plug the POWER socket back in.**
 - **Immediately plug the USB A-to-A cable**: IHU USB port → a **USB 2.0** port on the PC.
-- Confirm Linux sees the BROM device (vendor `0e8d`, product `0003`):
 
-```bash
-dmesg | grep -i -E '0e8d|mediatek|mt6771'
-```
+  ![A laptop connected by a USB A-to-A cable to the car's centre-console USB socket, with the gear selector in P](../images/usb-a-to-a-laptop-to-ihu.jpg)
+
+  *If working in the car rather than on a bench, use the **centre-console USB socket**. It is the **only** socket wired to the IHU data lines; every other USB port in the car is charge-only and will never enumerate.*
+
+- `mtk` detects the BROM endpoint (vendor `0e8d`, product `0003`), completes the single-shot handshake, uploads the Download Agent, and runs the session automatically. (If you ever need to check enumeration from a second terminal: `dmesg | grep -i -E '0e8d|mediatek|mt6771'`.)
 
 > [!CAUTION]
 > **Two ways to get the shorts wrong, and both cost you hardware.** Red is a live 3.3 V rail whenever the unit is powered. There are exactly two joins — **white↔blue** and **green↔red** — and nothing else may touch. Red touching white is a dead short across the IHU's 3.3 V supply. Check the colours twice before the tube goes on, because once it is shrunk you cannot see what is underneath. Never pull the JST jumper while the unit is powered.
@@ -771,6 +874,7 @@ export BASE="${BASE:-$HOME/IHU_DEPLOY}"
 [ -d "$BASE/DUMP" ] && mv "$BASE/DUMP" "$BASE/DUMP.old.$(date +%s)"
 mkdir -p "$BASE/DUMP"
 source ~/mtkclient/.venv/bin/activate
+rm -f .state "$BASE/.state" "$BASE/DUMP/.state"
 mtk multi "printgpt;r gpt $BASE/DUMP/gpt_full.bin;rl $BASE/DUMP --skip userdata"
 ```
 
@@ -813,10 +917,12 @@ if base < 0 or base + n * sz > len(g):
 bad = []
 for i in range(n):
     e = g[base + i*sz: base + (i+1)*sz]
-    if len(e) < 128: break
-    name = e[56:128].decode("utf-16le").rstrip("\x00")
+    if len(e) < 128 or e[16:32] == b"\x00" * 16: break
+    if e[:4] == b"\x00" * 4: continue
+    name = e[56:128].decode("utf-16le", errors="ignore").split("\x00", 1)[0]
     if not name: continue
     first, last = struct.unpack_from("<QQ", e, 32)
+    if first == 0 and last == 0: continue
     expected = (last - first + 1) * 512
     if name == "userdata": continue
     p = os.path.join(d, name + ".bin")
@@ -923,7 +1029,11 @@ assert len(a) == len(b), "STOP: lk size changed"
 d = [i for i in range(len(a)) if a[i] != b[i]]
 assert len(d) == 4 and b[d[0]:d[0]+4] == bytes([0x00,0x20,0x08,0xBD]), \
        "STOP: lk is not the expected 4-byte patch"
+assert d[0] in (0x3B392, 0x3C0FE), "STOP: lk patch offset 0x%X not in confirmed list" % d[0]
 print("lk patch proof OK at 0x%X" % d[0])
+for p in (base + "/ORI/boot.bin", base + "/MOD/boot.bin"):
+    assert open(p, "rb").read(8) == b"ANDROID!", "STOP: %s missing ANDROID! boot magic" % p
+print("boot image magic OK")
 PY
 python3 - "$BASE/DUMP/seccfg.bin" <<'PY'
 import sys
@@ -956,12 +1066,14 @@ Only when that prints `PREFLIGHT OK` should you continue. Re-enter BROM exactly 
 ```bash
 export BASE="${BASE:-$HOME/IHU_DEPLOY}"
 source ~/mtkclient/.venv/bin/activate
+rm -f .state "$BASE/.state" "$BASE/DUMP/.state"
 mtk multi "e metadata,userdata,md_udc;da seccfg unlock"
 ```
 
 If `md_udc` was **not** in the GPT list, use this instead:
 
 ```bash
+rm -f .state "$BASE/.state" "$BASE/DUMP/.state"
 mtk multi "e metadata,userdata;da seccfg unlock"
 ```
 
@@ -991,7 +1103,7 @@ Re-enter BROM ([8.2](#82--enter-brom-mode)) and run both writes plus a readback 
 export BASE="${BASE:-$HOME/IHU_DEPLOY}"
 source ~/mtkclient/.venv/bin/activate
 mkdir -p "$BASE/VERIFY"
-rm -f "$BASE/VERIFY/lk.bin" "$BASE/VERIFY/boot.bin"
+rm -f .state "$BASE/.state" "$BASE/DUMP/.state" "$BASE/VERIFY/.state" "$BASE/VERIFY/lk.bin" "$BASE/VERIFY/boot.bin"
 mtk multi "w lk $BASE/MOD/lk.bin;w boot $BASE/MOD/boot.bin;r lk $BASE/VERIFY/lk.bin;r boot $BASE/VERIFY/boot.bin"
 ```
 
@@ -1006,6 +1118,7 @@ If either line says `Failed to write` or `Filename doesn't exists`, **do not boo
 
 ```bash
 export BASE="${BASE:-$HOME/IHU_DEPLOY}"
+rm -f .state "$BASE/.state" "$BASE/DUMP/.state" "$BASE/VERIFY/.state"
 mtk multi "w lk $BASE/ORI/lk.bin;w boot $BASE/ORI/boot.bin"
 ```
 
@@ -1149,7 +1262,6 @@ ls -lh /data/local/tmp/mod/
 ```bash
 ls -l /data/local/tmp/mod/services.jar
 md5sum /data/local/tmp/mod/services.jar
-unzip -p /data/local/tmp/mod/services.jar classes.dex | head -c 8
 ```
 
 Compare that `md5sum` with the PC's value (they must be identical):
@@ -1159,7 +1271,7 @@ md5sum "$BASE/MOD/services.jar"
 ```
 
 > [!CAUTION]
-> If the hashes differ, the copy is bad. Recopy `services.jar` to the USB drive and repeat 11.2. Do **not** run `stop` with an unverified jar, and do not continue if the device-side size is 183 bytes or the `head -c 8` output is not `dex 039`.
+> If the hashes differ, the copy is bad. Recopy `services.jar` to the USB drive and repeat 11.2. Do **not** run `stop` with an unverified jar, and do not continue if the device-side size is 183 bytes.
 
 Record what you are about to rename, so recovery does not depend on memory:
 
@@ -1189,6 +1301,7 @@ Stage the new jar under a temporary name and prove it is complete **before** the
 cp /data/local/tmp/mod/services.jar /system/framework/services.jar.new
 chmod 644 /system/framework/services.jar.new
 chown root:root /system/framework/services.jar.new
+sync
 ls -l /system/framework/services.jar.new
 ```
 
@@ -1204,17 +1317,18 @@ if [ -e /system/framework/services.jar.orig ]; then
 else
   mv /system/framework/services.jar /system/framework/services.jar.orig
   mv /system/framework/services.jar.new /system/framework/services.jar
+  [ -e /system/framework/oat/arm64/services.odex ] && [ ! -e /system/framework/oat/arm64/services.odex.orig ] && \
+    mv /system/framework/oat/arm64/services.odex /system/framework/oat/arm64/services.odex.orig
+  [ -e /system/framework/oat/arm64/services.vdex ] && [ ! -e /system/framework/oat/arm64/services.vdex.orig ] && \
+    mv /system/framework/oat/arm64/services.vdex /system/framework/oat/arm64/services.vdex.orig
+  [ -e /system/framework/oat/arm64/services.art ]  && [ ! -e /system/framework/oat/arm64/services.art.orig ]  && \
+    mv /system/framework/oat/arm64/services.art  /system/framework/oat/arm64/services.art.orig
+  sync
 fi
 ```
 
 > [!CAUTION]
-> **Never overwrite `services.jar.orig`.** If the guard prints `STOP`, a previous deploy already left a `.orig` behind; that file is the stock jar. Roll back first (R1), then redeploy. Overwriting it with an already-modified jar destroys the only on-device copy of the original.
-
-```bash
-mv /system/framework/oat/arm64/services.odex /system/framework/oat/arm64/services.odex.orig
-mv /system/framework/oat/arm64/services.vdex /system/framework/oat/arm64/services.vdex.orig
-mv /system/framework/oat/arm64/services.art  /system/framework/oat/arm64/services.art.orig
-```
+> **Never overwrite `.orig` files.** If the guard prints `STOP`, a previous deploy already left a `.orig` behind; those `.orig` files are your stock framework and cache. Roll back first ([R1](#r1--uart-works-undo-the-live-deploy)), then redeploy. Overwriting them after a failed boot destroys the only on-device copy of the originals.
 
 > [!TIP]
 > If `services.art` does not exist on your build, that `mv` prints `No such file or directory` and nothing else is affected — skip it and continue. The other two must rename.
@@ -1290,6 +1404,7 @@ Run these one line at a time:
 su
 mount -o rw,remount /system
 mv /system/xbin/su /system/xbin/su.bak
+sync
 ls -l /system/xbin/su*
 ```
 
@@ -1307,7 +1422,9 @@ su
 > **If the fresh `su` fails, you are not stuck.** `/system/xbin/su.bak` is still setuid root — run it by full path, then put the original back:
 > ```bash
 > /system/xbin/su.bak
+> mount -o rw,remount /system
 > mv /system/xbin/su.bak /system/xbin/su
+> sync
 > ```
 > Reboot only after a plain `su` works, or leave the factory `su` in place.
 
@@ -1420,19 +1537,25 @@ Every destructive change in this guide is reversible **except the userdata erase
 Bootloop after the jar swap, or installs stopped working after a bad build:
 
 ```bash
-/system/xbin/su
+/system/xbin/su || /system/xbin/su.bak || su
 mount -o rw,remount /system
-mv /system/framework/services.jar.orig      /system/framework/services.jar
-mv /system/framework/oat/arm64/services.odex.orig /system/framework/oat/arm64/services.odex
-mv /system/framework/oat/arm64/services.vdex.orig /system/framework/oat/arm64/services.vdex
-mv /system/framework/oat/arm64/services.art.orig  /system/framework/oat/arm64/services.art
+rm -f /system/framework/services.jar.new
+[ -e /system/framework/services.jar.orig ] && \
+  mv /system/framework/services.jar.orig /system/framework/services.jar
+[ -e /system/framework/oat/arm64/services.odex.orig ] && \
+  mv /system/framework/oat/arm64/services.odex.orig /system/framework/oat/arm64/services.odex
+[ -e /system/framework/oat/arm64/services.vdex.orig ] && \
+  mv /system/framework/oat/arm64/services.vdex.orig /system/framework/oat/arm64/services.vdex
+[ -e /system/framework/oat/arm64/services.art.orig ] && \
+  mv /system/framework/oat/arm64/services.art.orig /system/framework/oat/arm64/services.art
+sync
 reboot
 ```
 
-If a `.orig` name is missing, that file was not renamed — skip that line. Do not `rm` anything. If the console disappeared after `stop`, power-cycle: the console returns during boot and the `.orig` files are still there.
+If a `.orig` name is missing, that file was not renamed — the `[ -e ... ]` guard skips it safely. Never `rm` any `.orig`, `.odex`, `.vdex` or `.art` file. If the console disappeared after `stop`, power-cycle: the console returns during boot and the `.orig` files are still there.
 
-> [!CAUTION]
-> **If you already renamed `/system/xbin/su` in [13.3](#133--remove-the-conflicting-factory-su), use plain `su` instead** — MagiskSU should grant it after the policy you set in 13.2. If it does not, you have no on-device root: restore `system.bin` from the dump over BROM ([R2](#r2--no-uart-brom-works-restore-from-the-dump)). Do not rename `su.bak` back until you have root again.
+> [!TIP]
+> **If you already renamed `/system/xbin/su` in [13.3](#133--remove-the-conflicting-factory-su):** `/system/xbin/su.bak` is still on `/system/xbin` with its setuid-root bit intact (`-rwsr-x--- root shell`). Even if MagiskSU (`su`) cannot answer during a framework bootloop, calling `/system/xbin/su.bak` by full path still hands you root directly over UART without needing BROM. Only if `/system` itself is corrupted should you restore `system.bin` over BROM ([R2](#r2--no-uart-brom-works-restore-from-the-dump)).
 
 ### R2 — No UART, BROM works: restore from the dump
 
@@ -1441,18 +1564,22 @@ Enter BROM exactly as in [8.2](#82--enter-brom-mode), then one session per group
 ```bash
 export BASE="${BASE:-$HOME/IHU_DEPLOY}"
 source ~/mtkclient/.venv/bin/activate
+rm -f .state "$BASE/.state" "$BASE/DUMP/.state" "$BASE/VERIFY/.state"
 # Boot chain only (most common recovery)
 mtk multi "w lk $BASE/ORI/lk.bin;w boot $BASE/ORI/boot.bin"
 
 # If /system was damaged or a bad system image was flashed
+rm -f .state "$BASE/.state" "$BASE/DUMP/.state" "$BASE/VERIFY/.state"
 mtk multi "w system $BASE/DUMP/system.bin"
 
 # If the lock state or unlock went wrong
+rm -f .state "$BASE/.state" "$BASE/DUMP/.state" "$BASE/VERIFY/.state"
 mtk multi "w seccfg $BASE/DUMP/seccfg.bin"
 
 # If the partition table itself was touched (rare).
 # gpt_restore.bin is only the MBR + GPT header + entry table,
 # never partition data. Never use another unit's file.
+rm -f .state "$BASE/.state" "$BASE/DUMP/.state" "$BASE/VERIFY/.state"
 mtk multi "w gpt $BASE/DUMP/gpt_restore.bin"
 ```
 
@@ -1474,6 +1601,7 @@ Relocking with modified images is how a recoverable unit becomes a boot failure.
 ```bash
 export BASE="${BASE:-$HOME/IHU_DEPLOY}"
 source ~/mtkclient/.venv/bin/activate
+rm -f .state "$BASE/.state" "$BASE/DUMP/.state" "$BASE/VERIFY/.state"
 mtk multi "da seccfg lock"
 ```
 
